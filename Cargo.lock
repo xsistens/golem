@@ -5446,6 +5446,7 @@ name = "integration-tests"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "assert2",
  "async-trait",
  "axum",
  "backtrace-on-stack-overflow",
@@ -5458,6 +5459,7 @@ dependencies = [
  "golem-api-grpc",
  "golem-client",
  "golem-common",
+ "golem-service-base",
  "golem-test-framework",
  "golem-wasm",
  "golem-wasm-derive",

@@ -370,6 +370,7 @@ impl<Ctx: WorkerCtx> PromiseService for DefaultPromiseService<Ctx> {
                     &owned_worker_id,
                     None,
                     None,
+                    Vec::new(),
                     None,
                     None,
                     &InvocationContextStack::fresh(),
