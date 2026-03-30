@@ -14,7 +14,7 @@
 
 use crate::bridge_gen::rust::rust::to_rust_ident;
 use crate::bridge_gen::type_naming::TypeNaming;
-use crate::bridge_gen::{BridgeGenerator, bridge_client_directory_name};
+use crate::bridge_gen::{BridgeGenerator, BridgeGeneratorConfig, bridge_client_directory_name};
 use crate::fs;
 use crate::sdk_overrides::{sdk_overrides, workspace_root};
 use anyhow::anyhow;
@@ -43,6 +43,7 @@ pub struct RustBridgeGenerator {
     agent_type: AgentType,
     testing: bool,
     same_language: bool,
+    config: BridgeGeneratorConfig,
 
     type_naming: TypeNaming<RustTypeName>,
     // TODO: we should integrate these names with type naming to avoid collisions
@@ -52,7 +53,12 @@ pub struct RustBridgeGenerator {
 }
 
 impl BridgeGenerator for RustBridgeGenerator {
-    fn new(agent_type: AgentType, target_path: &Utf8Path, testing: bool) -> anyhow::Result<Self> {
+    fn new(
+        agent_type: AgentType,
+        target_path: &Utf8Path,
+        testing: bool,
+        config: BridgeGeneratorConfig,
+    ) -> anyhow::Result<Self> {
         let same_language = agent_type.source_language.eq_ignore_ascii_case("rust");
         let type_naming = TypeNaming::new(&agent_type, same_language)?;
 
@@ -61,6 +67,7 @@ impl BridgeGenerator for RustBridgeGenerator {
             agent_type,
             testing,
             same_language,
+            config,
 
             type_naming,
             generated_language_enums: BTreeMap::new(),
@@ -90,6 +97,45 @@ impl BridgeGenerator for RustBridgeGenerator {
 }
 
 impl RustBridgeGenerator {
+    /// Returns derive attributes for a generated type, conditionally including serde
+    /// derives when the `serde` feature is enabled in the generated crate.
+    ///
+    /// Evaluates `BridgeGeneratorConfig::derive_rules` against the type name: each rule
+    /// whose regex pattern matches contributes its derives. All matching derives are
+    /// merged and deduplicated before emission.
+    fn base_derive_attrs(&self, type_name: &str) -> TokenStream {
+        let mut derive_set = Vec::<String>::new();
+        for rule in &self.config.derive_rules {
+            if let Ok(re) = regex::Regex::new(&rule.pattern) {
+                if re.is_match(type_name) {
+                    for d in &rule.derives {
+                        if !derive_set.contains(d) {
+                            derive_set.push(d.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let additional: Vec<TokenStream> = derive_set
+            .iter()
+            .filter_map(|d| syn::parse_str::<syn::Path>(d).ok())
+            .map(|path| quote! { #path })
+            .collect();
+
+        if additional.is_empty() {
+            quote! {
+                #[derive(Debug, Clone)]
+                #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+            }
+        } else {
+            quote! {
+                #[derive(Debug, Clone, #(#additional),*)]
+                #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+            }
+        }
+    }
+
     /// Generates the Cargo.toml manifest file
     fn generate_cargo_toml(&self, path: &Utf8Path) -> anyhow::Result<()> {
         let golem_source = if self.testing {
@@ -115,13 +161,59 @@ impl RustBridgeGenerator {
 
         doc["dependencies"] = Item::Table(Table::default());
         doc["dependencies"]["chrono"] = dep("0.4", &[]);
-        doc["dependencies"]["golem-client"] = golem_source.dep_item("golem-client", &[])?;
-        doc["dependencies"]["golem-common"] = golem_source.dep_item("golem-common", &["client"])?;
-        doc["dependencies"]["golem-wasm"] = golem_source.dep_item("golem-wasm", &["client"])?;
         doc["dependencies"]["nonempty-collections"] = dep("0.3.1", &[]);
-        doc["dependencies"]["reqwest"] = dep("0.13", &["rustls"]);
-        doc["dependencies"]["reqwest-middleware"] = dep("0.5", &[]);
         doc["dependencies"]["uuid"] = dep("1.18.1", &["v4"]);
+
+        // Client-only deps (networking, Golem SDK) — optional, behind `client` feature
+        fn optional_dep(version: &str, features: &[&str]) -> Item {
+            let mut entry = Item::Table(Table::default());
+            entry["version"] = value(version);
+            if !features.is_empty() {
+                let mut feature_items = Array::default();
+                for feature in features {
+                    feature_items.push(*feature);
+                }
+                entry["default-features"] = value(false);
+                entry["features"] = value(feature_items);
+            }
+            entry["optional"] = value(true);
+            entry
+        }
+
+        doc["dependencies"]["golem-client"] = golem_source.optional_dep_item("golem-client", &[])?;
+        doc["dependencies"]["golem-common"] = golem_source.optional_dep_item("golem-common", &["client"])?;
+        doc["dependencies"]["golem-wasm"] = golem_source.optional_dep_item("golem-wasm", &["client"])?;
+        doc["dependencies"]["reqwest"] = optional_dep("0.13", &["rustls"]);
+        doc["dependencies"]["reqwest-middleware"] = optional_dep("0.5", &[]);
+
+        // Optional serde dependency for JSON serialization
+        {
+            let mut serde_entry = Item::Table(Table::default());
+            serde_entry["version"] = value("1");
+            let mut serde_features = Array::default();
+            serde_features.push("derive");
+            serde_entry["features"] = value(serde_features);
+            serde_entry["optional"] = value(true);
+            doc["dependencies"]["serde"] = serde_entry;
+        }
+
+        // [features] section
+        doc["features"] = Item::Table(Table::default());
+        let mut serde_feat = Array::default();
+        serde_feat.push("dep:serde");
+        doc["features"]["serde"] = value(serde_feat);
+
+        let mut client_feat = Array::default();
+        client_feat.push("dep:golem-client");
+        client_feat.push("dep:golem-common");
+        client_feat.push("dep:golem-wasm");
+        client_feat.push("dep:reqwest");
+        client_feat.push("dep:reqwest-middleware");
+        doc["features"]["client"] = value(client_feat);
+
+        let mut default_feat = Array::default();
+        default_feat.push("client");
+        doc["features"]["default"] = value(default_feat);
 
         std::fs::write(path, doc.to_string())
             .map_err(|e| anyhow!("Failed to write Cargo.toml file: {e}"))?;
@@ -164,6 +256,7 @@ impl RustBridgeGenerator {
         let global_config = self.global_config();
 
         let types = self.type_definitions()?;
+        let param_conversions = self.generate_param_conversions()?;
         let multimodals = self.multimodals()?;
         let languages = self.languages_module();
         let mimetypes = self.mimetypes_module();
@@ -177,15 +270,20 @@ impl RustBridgeGenerator {
         let tokens = quote! {
             #![allow(unused)]
 
+            #[cfg(feature = "client")]
             use golem_common::base_model::agent::{UnstructuredBinaryExtensions, UnstructuredTextExtensions};
+            #[cfg(feature = "client")]
             use golem_wasm::{FromValueAndType, IntoValueAndType};
+            #[cfg(feature = "client")]
             #multimodal_import
 
+            #[cfg(feature = "client")]
             pub struct #client_struct_name {
                 constructor_parameters: golem_client::model::UntypedJsonDataValue,
                 phantom_id: Option<uuid::Uuid>,
             }
 
+            #[cfg(feature = "client")]
             impl std::fmt::Debug for #client_struct_name {
                 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                     f.debug_struct(stringify!(#client_struct_name))
@@ -195,6 +293,7 @@ impl RustBridgeGenerator {
                 }
             }
 
+            #[cfg(feature = "client")]
             impl #client_struct_name {
                 pub fn get(#(#constructor_params),*) -> Self {
                     #constructor_params_to_data_value
@@ -263,6 +362,8 @@ impl RustBridgeGenerator {
             #global_config
 
             #types
+
+            #param_conversions
 
             #multimodals
 
@@ -416,8 +517,7 @@ impl RustBridgeGenerator {
                             cases.push(quote! { #case_ident(#inner) });
 
                             // get_type() case — include the inner type
-                            let type_value = self.analysed_type_as_value(typ);
-                            case_type_tokens.push(quote! { Some(#type_value) });
+                            case_type_tokens.push(quote! { Some(<#inner as golem_wasm::IntoValue>::get_type()) });
 
                             // IntoValue implementation
                             into_value_cases.push(quote! {
@@ -457,12 +557,14 @@ impl RustBridgeGenerator {
                     }
                 }
 
+                let attrs = self.base_derive_attrs(&name.to_string());
                 Ok(quote! {
-                    #[derive(Debug, Clone)]
+                    #attrs
                     pub enum #name {
                         #(#cases),*
                     }
 
+                    #[cfg(feature = "client")]
                     impl golem_wasm::IntoValue for #name {
                         fn into_value(self) -> golem_wasm::Value {
                             match self {
@@ -486,6 +588,7 @@ impl RustBridgeGenerator {
                         }
                     }
 
+                    #[cfg(feature = "client")]
                     impl golem_wasm::FromValue for #name {
                         fn from_value(value: golem_wasm::Value) -> Result<Self, String> {
                             match value {
@@ -539,12 +642,14 @@ impl RustBridgeGenerator {
                     });
                 }
 
+                let attrs = self.base_derive_attrs(&name.to_string());
                 Ok(quote! {
-                    #[derive(Debug, Clone)]
+                    #attrs
                     pub enum #name {
                         #(#cases),*
                     }
 
+                    #[cfg(feature = "client")]
                     impl golem_wasm::IntoValue for #name {
                         fn into_value(self) -> golem_wasm::Value {
                             match self {
@@ -561,6 +666,7 @@ impl RustBridgeGenerator {
                         }
                     }
 
+                    #[cfg(feature = "client")]
                     impl golem_wasm::FromValue for #name {
                         fn from_value(value: golem_wasm::Value) -> Result<Self, String> {
                             match value {
@@ -610,12 +716,14 @@ impl RustBridgeGenerator {
 
                 let field_count = field_idents.len();
 
+                let attrs = self.base_derive_attrs(&name.to_string());
                 Ok(quote! {
-                    #[derive(Debug, Clone)]
+                    #attrs
                     pub struct #name {
                         #(#fields),*
                     }
 
+                    #[cfg(feature = "client")]
                     impl golem_wasm::IntoValue for #name {
                         fn into_value(self) -> golem_wasm::Value {
                             golem_wasm::Value::Record(vec![
@@ -638,6 +746,7 @@ impl RustBridgeGenerator {
                         }
                     }
 
+                    #[cfg(feature = "client")]
                     impl golem_wasm::FromValue for #name {
                         fn from_value(value: golem_wasm::Value) -> Result<Self, String> {
                             match value {
@@ -1629,8 +1738,10 @@ impl RustBridgeGenerator {
 
     fn global_config(&self) -> TokenStream {
         quote! {
+            #[cfg(feature = "client")]
             static CONFIG: std::sync::OnceLock<golem_client::bridge::Configuration> = std::sync::OnceLock::new();
 
+            #[cfg(feature = "client")]
             pub fn configure(server: golem_client::bridge::GolemServer, app_name: &str, env_name: &str) {
                 CONFIG
                     .set(golem_client::bridge::Configuration {
@@ -1983,6 +2094,184 @@ impl RustBridgeGenerator {
         }
     }
 
+    /// Detects `Type`/`TypeParam` pairs and generates bidirectional `From` impls.
+    ///
+    /// The `#[agent_definition]` macro creates paired WIT types where input parameter
+    /// types get a `Param` suffix. These are always structurally identical to their
+    /// non-Param counterparts. This method generates `From` conversions between them.
+    fn generate_param_conversions(&self) -> anyhow::Result<TokenStream> {
+        if !self.config.generate_param_conversions {
+            return Ok(quote! {});
+        }
+
+        // Collect all named types: name_string -> (AnalysedType, RustTypeName)
+        let type_map: HashMap<String, (&AnalysedType, &RustTypeName)> = self
+            .type_naming
+            .types()
+            .map(|(typ, name)| (name.to_string(), (typ, name)))
+            .collect();
+
+        let mut conversions = Vec::new();
+
+        // Find all "FooParam" types that have a matching "Foo"
+        for (param_name_str, (param_type, _param_rust_name)) in &type_map {
+            let Some(base_name_str) = param_name_str.strip_suffix("Param") else {
+                continue;
+            };
+            let Some((base_type, _base_rust_name)) = type_map.get(base_name_str) else {
+                continue;
+            };
+
+            let param_ident = Ident::new(param_name_str, Span::call_site());
+            let base_ident = Ident::new(base_name_str, Span::call_site());
+
+            match (base_type, param_type) {
+                (AnalysedType::Enum(base_enum), AnalysedType::Enum(param_enum)) => {
+                    // Both are simple enums — verify same cases
+                    if base_enum.cases != param_enum.cases {
+                        continue;
+                    }
+                    let case_idents: Vec<Ident> = base_enum
+                        .cases
+                        .iter()
+                        .map(|c| {
+                            Ident::new(
+                                &to_rust_ident(c, self.same_language).to_upper_camel_case(),
+                                Span::call_site(),
+                            )
+                        })
+                        .collect();
+
+                    conversions.push(quote! {
+                        impl From<#param_ident> for #base_ident {
+                            fn from(v: #param_ident) -> Self {
+                                match v {
+                                    #(#param_ident::#case_idents => #base_ident::#case_idents),*
+                                }
+                            }
+                        }
+
+                        impl From<#base_ident> for #param_ident {
+                            fn from(v: #base_ident) -> Self {
+                                match v {
+                                    #(#base_ident::#case_idents => #param_ident::#case_idents),*
+                                }
+                            }
+                        }
+                    });
+                }
+                (AnalysedType::Variant(base_var), AnalysedType::Variant(param_var)) => {
+                    // Both are variants — verify same case names
+                    if base_var.cases.len() != param_var.cases.len() {
+                        continue;
+                    }
+                    let cases_match = base_var
+                        .cases
+                        .iter()
+                        .zip(param_var.cases.iter())
+                        .all(|(a, b)| a.name == b.name && a.typ.is_some() == b.typ.is_some());
+                    if !cases_match {
+                        continue;
+                    }
+
+                    let mut forward_arms = Vec::new();
+                    let mut reverse_arms = Vec::new();
+
+                    for case in &base_var.cases {
+                        let case_ident = Ident::new(
+                            &to_rust_ident(&case.name, self.same_language).to_upper_camel_case(),
+                            Span::call_site(),
+                        );
+                        if case.typ.is_some() {
+                            // Tuple variant — use .into() for nested conversion
+                            forward_arms.push(
+                                quote! { #param_ident::#case_ident(x) => #base_ident::#case_ident(x.into()) },
+                            );
+                            reverse_arms.push(
+                                quote! { #base_ident::#case_ident(x) => #param_ident::#case_ident(x.into()) },
+                            );
+                        } else {
+                            // Unit variant
+                            forward_arms.push(
+                                quote! { #param_ident::#case_ident => #base_ident::#case_ident },
+                            );
+                            reverse_arms.push(
+                                quote! { #base_ident::#case_ident => #param_ident::#case_ident },
+                            );
+                        }
+                    }
+
+                    conversions.push(quote! {
+                        impl From<#param_ident> for #base_ident {
+                            fn from(v: #param_ident) -> Self {
+                                match v {
+                                    #(#forward_arms),*
+                                }
+                            }
+                        }
+
+                        impl From<#base_ident> for #param_ident {
+                            fn from(v: #base_ident) -> Self {
+                                match v {
+                                    #(#reverse_arms),*
+                                }
+                            }
+                        }
+                    });
+                }
+                (AnalysedType::Record(base_rec), AnalysedType::Record(param_rec)) => {
+                    // Both are records — verify same field names
+                    if base_rec.fields.len() != param_rec.fields.len() {
+                        continue;
+                    }
+                    let fields_match = base_rec
+                        .fields
+                        .iter()
+                        .zip(param_rec.fields.iter())
+                        .all(|(a, b)| a.name == b.name);
+                    if !fields_match {
+                        continue;
+                    }
+
+                    let field_idents: Vec<Ident> = base_rec
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            Ident::new(
+                                &to_rust_ident(&f.name, self.same_language).to_snake_case(),
+                                Span::call_site(),
+                            )
+                        })
+                        .collect();
+
+                    conversions.push(quote! {
+                        impl From<#param_ident> for #base_ident {
+                            fn from(v: #param_ident) -> Self {
+                                Self {
+                                    #(#field_idents: v.#field_idents.into()),*
+                                }
+                            }
+                        }
+
+                        impl From<#base_ident> for #param_ident {
+                            fn from(v: #base_ident) -> Self {
+                                Self {
+                                    #(#field_idents: v.#field_idents.into()),*
+                                }
+                            }
+                        }
+                    });
+                }
+                _ => {
+                    // Mismatched types — skip
+                    continue;
+                }
+            }
+        }
+
+        Ok(quote! { #(#conversions)* })
+    }
+
     fn package_name(&self) -> String {
         self.package_crate_name().to_snake_case()
     }
@@ -2011,6 +2300,12 @@ impl GolemDependencySource {
                 features,
             )),
         }
+    }
+
+    fn optional_dep_item(&self, crate_path: &str, features: &[&str]) -> anyhow::Result<Item> {
+        let mut item = self.dep_item(crate_path, features)?;
+        item["optional"] = value(true);
+        Ok(item)
     }
 }
 
